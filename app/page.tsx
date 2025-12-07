@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { z } from "zod";
-import { Controller, useForm } from "react-hook-form";
+import { Controller, useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Shuffle, RotateCw, UsersRound, Trophy } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -17,19 +17,15 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Table, Tbody, Td, Th, Thead, Tr } from "@/components/ui/table";
-import { Slider } from "@/components/ui/slider";
-import { Input } from "@/components/ui/input";
+import {
+  generateSchedule,
+  toPlayers,
+  type Match,
+  type Player,
+  type Team,
+} from "@/lib/scheduler";
 
-type Player = { id: string; name: string };
-type Team = [Player, Player];
 type Score = { teamA: number | null; teamB: number | null };
-type Match = {
-  id: string;
-  round: number;
-  court: number;
-  teamA: Team;
-  teamB: Team;
-};
 
 const formSchema = z.object({
   names: z
@@ -55,174 +51,8 @@ const parseNames = (value: string) =>
 const ensureEvenPlayers = (players: string[]) =>
   players.length % 2 === 0 ? players : [...players, "Bye"];
 
-const toPlayers = (names: string[]): Player[] =>
-  names.map((name, index) => ({ id: `${index}-${name}`, name }));
-
-type PartnerCounts = Record<string, Record<string, number>>;
-type OpponentCounts = Record<string, Record<string, number>>;
-
-const getKey = (players: Player[]) =>
-  players
-    .map((p) => p.id)
-    .sort()
-    .join("_");
-
-const incrementCount = (
-  map: PartnerCounts | OpponentCounts,
-  a: Player,
-  b: Player
-) => {
-  if (!map[a.id]) map[a.id] = {};
-  map[a.id][b.id] = (map[a.id][b.id] || 0) + 1;
-};
-
-const getCount = (
-  map: PartnerCounts | OpponentCounts,
-  a: Player,
-  b: Player
-) => map[a.id]?.[b.id] || 0;
-
-const generateAllTeams = (players: Player[]) => {
-  const filtered = players.filter((p) => p.name !== "Bye");
-  const teams: Team[] = [];
-  for (let i = 0; i < filtered.length; i += 1) {
-    for (let j = i + 1; j < filtered.length; j += 1) {
-      teams.push([filtered[i], filtered[j]]);
-    }
-  }
-  return teams;
-};
-
-const scoreMatch = (
-  teamA: Team,
-  teamB: Team,
-  partnerCounts: PartnerCounts,
-  opponentCounts: OpponentCounts,
-  playCounts: Record<string, number>
-) => {
-  const partnerPenalty =
-    getCount(partnerCounts, teamA[0], teamA[1]) +
-    getCount(partnerCounts, teamA[1], teamA[0]) +
-    getCount(partnerCounts, teamB[0], teamB[1]) +
-    getCount(partnerCounts, teamB[1], teamB[0]);
-
-  const opponentPenalty =
-    getCount(opponentCounts, teamA[0], teamB[0]) +
-    getCount(opponentCounts, teamA[0], teamB[1]) +
-    getCount(opponentCounts, teamA[1], teamB[0]) +
-    getCount(opponentCounts, teamA[1], teamB[1]) +
-    getCount(opponentCounts, teamB[0], teamA[0]) +
-    getCount(opponentCounts, teamB[0], teamA[1]) +
-    getCount(opponentCounts, teamB[1], teamA[0]) +
-    getCount(opponentCounts, teamB[1], teamA[1]);
-
-  const sitBalancePenalty =
-    (playCounts[teamA[0].id] || 0) +
-    (playCounts[teamA[1].id] || 0) +
-    (playCounts[teamB[0].id] || 0) +
-    (playCounts[teamB[1].id] || 0);
-
-  return partnerPenalty * 5 + opponentPenalty * 3 + sitBalancePenalty;
-};
-
-const pickRoundMatches = (
-  teams: Team[],
-  partnerCounts: PartnerCounts,
-  opponentCounts: OpponentCounts,
-  playCounts: Record<string, number>,
-  courtCount: number
-): Team[][] => {
-  if (courtCount === 0) return [];
-
-  const candidates: { match: Team[]; score: number }[] = [];
-  for (let i = 0; i < teams.length; i += 1) {
-    for (let j = i + 1; j < teams.length; j += 1) {
-      const teamA = teams[i];
-      const teamB = teams[j];
-      const ids = new Set([
-        teamA[0].id,
-        teamA[1].id,
-        teamB[0].id,
-        teamB[1].id,
-      ]);
-      if (ids.size !== 4) continue;
-      const score = scoreMatch(teamA, teamB, partnerCounts, opponentCounts, playCounts);
-      candidates.push({ match: [teamA, teamB], score });
-    }
-  }
-
-  candidates.sort((a, b) => a.score - b.score || getKey(a.match.flat()) .localeCompare(getKey(b.match.flat())));
-
-  const best: Team[][] = [];
-  const used = new Set<string>();
-  for (const candidate of candidates) {
-    if (best.length >= courtCount) break;
-    const ids = candidate.match.flat().map((p) => p.id);
-    const conflict = ids.some((id) => used.has(id));
-    if (conflict) continue;
-    candidate.match.flat().forEach((p) => used.add(p.id));
-    best.push(candidate.match);
-  }
-
-  return best;
-};
-
-const computeTargetRounds = (playerCount: number, courtCount: number) => {
-  const base = Math.max(playerCount - 1, 1);
-  const buffer = Math.ceil(Math.max(0, playerCount - 4) / Math.max(courtCount, 1));
-  return Math.min(base + buffer, 50);
-};
-
-const generateSchedule = (players: Player[], courtCount: number): Match[] => {
-  if (players.length < 4) return [];
-
-  const totalRoundsRequested = computeTargetRounds(players.length, courtCount);
-  const teams = generateAllTeams(players);
-  if (teams.length === 0) return [];
-
-  const partnerCounts: PartnerCounts = {};
-  const opponentCounts: OpponentCounts = {};
-  const playCounts: Record<string, number> = {};
-  const matches: Match[] = [];
-
-  for (let round = 0; round < totalRoundsRequested; round += 1) {
-    const roundMatches = pickRoundMatches(
-      teams,
-      partnerCounts,
-      opponentCounts,
-      playCounts,
-      courtCount
-    );
-
-    if (roundMatches.length === 0) break;
-
-    roundMatches.forEach((pair, index) => {
-      const [teamA, teamB] = pair;
-      teamA.forEach((player) => {
-        playCounts[player.id] = (playCounts[player.id] || 0) + 1;
-        incrementCount(partnerCounts, player, teamA[0] === player ? teamA[1] : teamA[0]);
-        incrementCount(opponentCounts, player, teamB[0]);
-        incrementCount(opponentCounts, player, teamB[1]);
-      });
-      teamB.forEach((player) => {
-        playCounts[player.id] = (playCounts[player.id] || 0) + 1;
-        incrementCount(partnerCounts, player, teamB[0] === player ? teamB[1] : teamB[0]);
-        incrementCount(opponentCounts, player, teamA[0]);
-        incrementCount(opponentCounts, player, teamA[1]);
-      });
-
-      matches.push({
-        id: `${round + 1}-${index}`,
-        round: round + 1,
-        court: index + 1,
-        teamA,
-        teamB,
-      });
-    });
-  }
-
-  return matches;
-};
+import { Slider } from "@/components/ui/slider";
+import { Input } from "@/components/ui/input";
 
 const defaultRoster = [
   "Alex",
@@ -246,8 +76,11 @@ export default function Home() {
     defaultValues: { names: defaultRoster.join("\n"), courts: 2 },
   });
 
-  const playerNames = ensureEvenPlayers(parseNames(form.watch("names")));
-  const courtCount = Math.min(Math.max(form.watch("courts") || 2, 1), 6);
+  const watchedNames = useWatch({ control: form.control, name: "names" });
+  const watchedCourts = useWatch({ control: form.control, name: "courts" });
+
+  const playerNames = ensureEvenPlayers(parseNames(watchedNames ?? ""));
+  const courtCount = Math.min(Math.max(watchedCourts || 2, 1), 6);
   const players = useMemo(() => toPlayers(playerNames), [playerNames]);
   const schedule = useMemo(
     () => generateSchedule(players, courtCount),
@@ -324,7 +157,7 @@ export default function Home() {
 
         <form
           onSubmit={form.handleSubmit(onSubmit)}
-          className="grid gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900 md:grid-cols-[2fr_1fr]"
+          className="grid gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900"
         >
           <div className="flex flex-col gap-3">
             <div className="grid gap-3 sm:grid-cols-1">
@@ -378,27 +211,7 @@ export default function Home() {
                 {form.formState.errors.names.message}
               </p>
             )}
-          </div>
-          <div className="flex flex-col gap-3 rounded-xl bg-slate-50 p-4 dark:bg-slate-800/50">
-            <div className="flex items-center gap-2 text-sm font-semibold text-slate-800 dark:text-slate-100">
-              <Trophy size={18} />
-              Quick tips
-            </div>
-            <ul className="list-disc space-y-2 pl-5 text-sm text-slate-600 dark:text-slate-300">
-              <li>Even player count works best. We add a Bye if needed.</li>
-              <li>Each round mixes partners and opponents.</li>
-              <li>
-                Courts cap matches per round; extra players will sit that round.
-              </li>
-            </ul>
             <div className="flex flex-wrap gap-2">
-              <Button
-                type="submit"
-                aria-label="Generate schedule"
-                className="w-full sm:w-auto"
-              >
-                Generate schedule
-              </Button>
               <Button
                 type="button"
                 variant="outline"
